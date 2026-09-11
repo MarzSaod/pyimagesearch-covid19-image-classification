@@ -77,7 +77,7 @@ def run_model(baseModel, model_name, dataset_dir_name, trainX, testX, trainY, te
         layer.trainable = False
     # compile our model
     print("[INFO] compiling model...")
-    opt = Adam(lr=INIT_LR, decay=INIT_LR / EPOCHS)
+    opt = Adam(learning_rate=INIT_LR)
     model.compile(loss="categorical_crossentropy", optimizer=opt,
                   metrics=["accuracy"])
 
@@ -94,7 +94,7 @@ def run_model(baseModel, model_name, dataset_dir_name, trainX, testX, trainY, te
 
     # train the head of the network
     print("[INFO] training head...")
-    H = model.fit_generator(
+    H = model.fit(
         trainAug.flow(trainX, trainY, batch_size=BS),
         steps_per_epoch=len(trainX) // BS,
         validation_data=(testX, testY),
