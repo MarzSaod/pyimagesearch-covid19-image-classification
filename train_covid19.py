@@ -35,91 +35,51 @@ BS = 8
 
 
 
-def run_model(baseModel, model_name, dataset_dir_name, trainX, testX, trainY, testY, lb):
-    """
-
-    :param baseModel:
-    :type baseModel:
-    :param model_name:
-    :type model_name:
-    :param trainX:
-    :type trainX:
-    :param testX:
-    :type testX:
-    :param trainY:
-    :type trainY:
-    :param testY:
-    :type testY:
-    :param lb:
-    :type lb:
-    :return:  [confusion matrix, classification report, model name]
-    :rtype: List
-    """
+def run_model(baseModel, model_name, dataset_dir_name, train_generator, val_generator, class_labels):
     saved_model_path = os.path.sep.join(['.', 'models', f'{model_name}-{dataset_dir_name}-model.h5'])
-    # load the VGG16 network, ensuring the head FC layer sets are left
-    # off
-    # baseModel = VGG16(weights="imagenet", include_top=False,
-    # 						input_tensor=Input(shape=(224, 224, 3)))
-    # construct the head of the model that will be placed on top of the
-    # the base model
+
     headModel = baseModel.output
     headModel = AveragePooling2D(pool_size=(4, 4))(headModel)
     headModel = Flatten(name="flatten")(headModel)
     headModel = Dense(64, activation="relu")(headModel)
     headModel = Dropout(0.5)(headModel)
     headModel = Dense(3, activation="softmax")(headModel)
-    # place the head FC model on top of the base model (this will become
-    # the actual model we will train)
+
     model = Model(inputs=baseModel.input, outputs=headModel)
-    # loop over all layers in the base model and freeze them so they will
-    # *not* be updated during the first training process
+
     for layer in baseModel.layers:
         layer.trainable = False
-    # compile our model
+
     print("[INFO] compiling model...")
     opt = Adam(learning_rate=INIT_LR)
     model.compile(loss="categorical_crossentropy", optimizer=opt,
                   metrics=["accuracy"])
 
-    # initialize the training data augmentation object
-    trainAug = ImageDataGenerator(
-        rotation_range=15,
-        fill_mode="nearest")
-
-    # setup callback to save the best model
     fname = os.path.sep.join(['.', 'models', f"best-{model_name}-{dataset_dir_name}-model.h5"])
     checkpoint = ModelCheckpoint(fname, monitor="val_loss", mode="min",
                                  save_best_only=True, verbose=1)
     callbacks = [checkpoint]
 
-    # train the head of the network
     print("[INFO] training head...")
     H = model.fit(
-        trainAug.flow(trainX, trainY, batch_size=BS),
-        steps_per_epoch=len(trainX) // BS,
-        validation_data=(testX, testY),
-        validation_steps=len(testX) // BS,
+        train_generator,
+        validation_data=val_generator,
         epochs=EPOCHS,
         verbose=1,
         callbacks=callbacks)
 
-    # make predictions on the testing set
     print("[INFO] evaluating network...")
     best_model = load_model(fname)
-    predIdxs = best_model.predict(testX, batch_size=BS)
-
-    # for each image in the testing set we need to find the index of the
-    # label with corresponding largest predicted probability
+    val_generator.reset()
+    predIdxs = best_model.predict(val_generator)
     predIdxs = np.argmax(predIdxs, axis=1)
-    # show a nicely formatted classification report
-    class_report = classification_report(testY.argmax(axis=1), predIdxs,
-                                target_names=lb.classes_)
-    print(class_report)
-    # compute the confusion matrix and and use it to derive the raw
-    # accuracy, sensitivity, and specificity
-    cm = confusion_matrix(testY.argmax(axis=1), predIdxs)
 
-    # plot the training loss and accuracy
+    true_labels = val_generator.classes
+    class_report = classification_report(true_labels, predIdxs, target_names=class_labels)
+    print(class_report)
+
+    cm = confusion_matrix(true_labels, predIdxs)
+
     N = EPOCHS
     plt.style.use("ggplot")
     plt.figure()
@@ -132,62 +92,41 @@ def run_model(baseModel, model_name, dataset_dir_name, trainX, testX, trainY, te
     plt.ylabel("Loss/Accuracy")
     plt.legend(loc="lower left")
     plt.savefig(os.path.sep.join(['.', 'model_performance', f'{model_name}-{dataset_dir_name}-plot.png']))
-    # serialize the model to disk
+
     print("[INFO] saving COVID-19 detector model...")
     model.save(saved_model_path, save_format="h5")
 
     return [cm, class_report, model_name]
 
 def train_covid_models(dataset_dir, models=None):
-    """
+    print("[INFO] setting up data generators...")
 
-    :param dataset_dir: root path to a directory with folders named for the target labels.
-    :type dataset_dir:
-    :param models:
-    :type models:
-    :return: List of List of [accuracy, sensitivity, specificity, model name]
-    :rtype:
-    """
+    trainAug = ImageDataGenerator(
+        rotation_range=15,
+        fill_mode="nearest",
+        rescale=1./255,
+        validation_split=0.20)
 
-    # grab the list of images in our dataset directory, then initialize
-    # the list of data (i.e., images) and class images
-    print("[INFO] loading images...")
-    imagePaths = list(paths.list_images(dataset_dir))
-    data = []
-    labels = []
+    train_generator = trainAug.flow_from_directory(
+        dataset_dir,
+        target_size=(224, 224),
+        batch_size=BS,
+        class_mode="categorical",
+        subset="training",
+        shuffle=True,
+        seed=42)
 
-    # loop over the image paths
-    for imagePath in imagePaths:
-        # extract the class label from the filename
-        label = imagePath.split(os.path.sep)[-2]
+    val_generator = trainAug.flow_from_directory(
+        dataset_dir,
+        target_size=(224, 224),
+        batch_size=BS,
+        class_mode="categorical",
+        subset="validation",
+        shuffle=False,
+        seed=42)
 
-        # load the image, swap color channels, and resize it to be a fixed
-        # 224x224 pixels while ignoring aspect ratio
-        image = cv2.imread(imagePath)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (224, 224))
-
-        # update the data and labels lists, respectively
-        data.append(image)
-        labels.append(label)
-
-    # convert the data and labels to NumPy arrays while scaling the pixel
-    # intensities to the range [0, 255]
-    data = np.array(data) / 255.0
-    labels = np.array(labels)
-    # print(f"Labels: {labels}")
-
-    # perform one-hot encoding on the labels
-    lb = LabelBinarizer()
-    labels = lb.fit_transform(labels)
-
-    # print(f"Labels: {labels}")
-    print(f"Class Labels: {lb.classes_}")
-
-    # partition the data into training and testing splits using 80% of
-    # the data for training and the remaining 20% for testing
-    (trainX, testX, trainY, testY) = train_test_split(data, labels,
-                                                      test_size=0.20, stratify=labels, random_state=42)
+    class_labels = list(train_generator.class_indices.keys())
+    print(f"Class Labels: {class_labels}")
 
     if models is None:
         MODELS = [
@@ -200,30 +139,19 @@ def train_covid_models(dataset_dir, models=None):
                 "base_model": VGG19(weights="imagenet", include_top=False,
                                     input_tensor=Input(shape=(224, 224, 3))),
                 "name": "vgg19"
-            },
-            # {
-            #     "base_model": ResNet50(weights="imagenet", include_top=False,
-            #                            input_tensor=Input(shape=(224, 224, 3))),
-            #     "name": "resnet50"
-            #
-            # },
-            # {
-            #     "base_model": ResNet50V2(weights="imagenet", include_top=False,
-            #                            input_tensor=Input(shape=(224, 224, 3))),
-            #     "name": "resnet50v2"
-            #
-            # }
+            }
         ]
     else:
         MODELS = models
 
     all_model_run_results = []
-    dataset_dir_name = dataset_dir.split("/")[-1]
+    dataset_dir_name = dataset_dir.rstrip("/").split("/")[-1]
     for model in MODELS:
         print("---------------------------------------------------")
         print(f"Running Model: {model['name']}")
         start = time.time()
-        model_results = run_model(model['base_model'], model['name'], dataset_dir_name, trainX, testX, trainY, testY, lb)
+        model_results = run_model(model['base_model'], model['name'], dataset_dir_name,
+                                   train_generator, val_generator, class_labels)
         end = time.time()
         all_model_run_results.append(model_results)
         print(f"Finished Model: {model['name']} took {(end-start)/60} minutes")
