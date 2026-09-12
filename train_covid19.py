@@ -31,7 +31,7 @@ import time
 # and batch size
 INIT_LR = 1e-3
 EPOCHS = 25
-BS = 32
+BS = 8
 
 
 
