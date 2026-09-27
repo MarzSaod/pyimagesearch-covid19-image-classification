@@ -4,7 +4,7 @@
 # import the necessary packages
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import ModelCheckpoint
-from tensorflow.keras.applications import VGG16,VGG19, ResNet50V2, ResNet50
+from tensorflow.keras.applications import VGG16, VGG19, ResNet50V2, ResNet50, InceptionV3
 from tensorflow.keras.layers import AveragePooling2D
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.layers import Flatten
@@ -139,6 +139,11 @@ def train_covid_models(dataset_dir, models=None):
                 "base_model": VGG19(weights="imagenet", include_top=False,
                                     input_tensor=Input(shape=(224, 224, 3))),
                 "name": "vgg19"
+            },
+            {
+                "base_model": InceptionV3(weights="imagenet", include_top=False,
+                                    input_tensor=Input(shape=(224, 224, 3))),
+                "name": "inceptionv3"
             }
         ]
     else:
@@ -185,4 +190,3 @@ if __name__ == '__main__':
             result[0], index=['covid', 'normal', 'pneumonia'], columns=['covid', 'normal', 'pneumonia'],
         )
         print(df_cm.head())
-
