@@ -56,7 +56,7 @@ def run_model(baseModel, model_name, dataset_dir_name, train_generator, val_gene
                   metrics=["accuracy"])
 
     fname = os.path.sep.join(['.', 'models', f"best-{model_name}-{dataset_dir_name}-model.h5"])
-    checkpoint = ModelCheckpoint(fname, monitor="val_loss", mode="min",
+    checkpoint = ModelCheckpoint(fname, monitor="val_accuracy", mode="max",
                                  save_best_only=True, verbose=1)
     callbacks = [checkpoint]
 
