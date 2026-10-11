@@ -10,9 +10,12 @@ It does three jobs:
 
 Everything reads the files that train_covid19.py saves into outputs/<model>_<run name>/.
 """
+import hashlib
 import json
 import os
 import textwrap
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -22,6 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
+from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
@@ -254,6 +258,13 @@ def compare_runs(run_dirs, out_png=None, show=True, target_class="pneumonia"):
         row[f"{tname.capitalize()} precision"] = rep[tname]["precision"]
         for k, v in m["missed_to"].items():
             row[f"{tname.capitalize()} called {k}"] = v
+        # held out test results (only present when a run used --test_frac)
+        tm_path = Path(rd) / "test_metrics.json"
+        if tm_path.exists():
+            with open(tm_path) as f:
+                tm = json.load(f)
+            row["Test accuracy"] = tm["accuracy"]
+            row[f"Test {tname} recall"] = tm["recall"][tname]
         rows.append(row)
         names.append(pretty_name(run["config"]))
         recalls.append([rep[c]["recall"] for c in classes])
@@ -525,3 +536,169 @@ def clahe_preview(dataset_dir, n_per_class=2, seed=0, out_png=None, show=True):
         plt.show()
     plt.close(fig)
     return out_png
+
+
+# ---------------------------------------------------------------------------
+# Dataset listing and image loading (shared by training and the checks below)
+# ---------------------------------------------------------------------------
+IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".ppm", ".tif", ".tiff")
+
+
+def list_dataset(dataset_dir):
+    """
+    Lists images the same way Keras flow_from_directory does:
+    class folders in sorted order, files in sorted order, only these image extensions.
+    Returns class names, file paths, integer labels, and a count of skipped non image files.
+    """
+    classes = sorted(d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d)))
+    files, labels, skipped = [], [], Counter()
+    for ci, c in enumerate(classes):
+        folder = os.path.join(dataset_dir, c)
+        for root, _, fnames in sorted(os.walk(folder), key=lambda x: x[0]):
+            for fn in sorted(fnames):
+                if fn.lower().endswith(IMG_EXT):
+                    files.append(os.path.join(root, fn))
+                    labels.append(ci)
+                else:
+                    skipped[(c, os.path.splitext(fn)[1].lower() or "(no extension)")] += 1
+    return classes, files, np.array(labels, dtype=int), skipped
+
+
+def load_image_array(files, size=224, workers=4):
+    """Loads every image once as a small uint8 array (about 150 KB each). Uses the same resize Keras uses."""
+    X = np.empty((len(files), size, size, 3), dtype=np.uint8)
+
+    def one(i):
+        with Image.open(files[i]) as im:
+            X[i] = np.asarray(im.convert("RGB").resize((size, size), Image.NEAREST), dtype=np.uint8)
+
+    with ThreadPoolExecutor(workers) as ex:
+        list(ex.map(one, range(len(files))))
+    return X
+
+
+def file_fingerprint(files):
+    return hashlib.md5("\n".join(files).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Check 1: does the model sort pneumonia by image type instead of by disease?
+# ---------------------------------------------------------------------------
+def source_check(run_dir, workers=4):
+    """
+    Compares simple facts about images the model got right and wrong: original size, brightness, dark borders.
+    If caught pneumonia images look different from missed ones (and missed ones look like normal images),
+    the model may be using image style instead of disease.
+    """
+    run = load_run(run_dir)
+    names = run["classes"]
+    pred = run["probs"].argmax(axis=1)
+
+    def facts(path):
+        with Image.open(path) as im:
+            w, h = im.size
+            g = np.asarray(im.convert("L").resize((224, 224)), dtype=float)
+        return w, h, g.mean(), (g[:, :12] < 20).mean() + (g[:, -12:] < 20).mean()
+
+    with ThreadPoolExecutor(workers) as ex:
+        out = list(ex.map(facts, run["files"]))
+    df = pd.DataFrame(out, columns=["width", "height", "mean_brightness", "dark_border_share"])
+    df["outcome"] = [f"{names[y]} -> {names[p]}" for y, p in zip(run["labels"], pred)]
+    df["true"] = [names[y] for y in run["labels"]]
+    df["size"] = df["width"].astype(str) + "x" + df["height"].astype(str)
+
+    keep = [o for o in [f"{c} -> {c}" for c in names] + ["pneumonia -> normal"] if o in set(df["outcome"])]
+    table = df[df["outcome"].isin(keep)].groupby("outcome")[
+        ["width", "height", "mean_brightness", "dark_border_share"]].median().round(2)
+    table["count"] = df[df["outcome"].isin(keep)].groupby("outcome").size()
+    table = table.loc[keep]
+
+    sizes = []
+    for c in names:
+        counts = df[df["true"] == c]["size"].value_counts()
+        sizes.append({"class": c, "different image sizes": len(counts),
+                      "most common size": counts.index[0], "share of images with it": counts.iloc[0] / counts.sum()})
+    return table, pd.DataFrame(sizes).set_index("class"), df
+
+
+# ---------------------------------------------------------------------------
+# Check 2: are near copies of training images sitting in the validation set?
+# ---------------------------------------------------------------------------
+def _thumbs(files, size=32, workers=4):
+    def one(p):
+        with Image.open(p) as im:
+            g = np.asarray(im.convert("L").resize((size, size), Image.BOX), dtype=np.float32)
+        g = g.ravel() - g.mean()
+        return g / (np.linalg.norm(g) + 1e-8)
+
+    with ThreadPoolExecutor(workers) as ex:
+        return np.stack(list(ex.map(one, files)))
+
+
+def duplicate_check(dataset_dir, run_dir, size=32, thresholds=(0.99, 0.98, 0.95, 0.90),
+                    n_show=4, out_png=None, show=True, workers=4):
+    """
+    For every validation image, finds the most similar training image (also trying a mirrored copy).
+    Similarity is the correlation of tiny gray versions, where 1.00 means identical.
+    Reports how many validation images have a near copy in training, and whether the model
+    scores better on those, which would mean validation accuracy is inflated.
+    """
+    run = load_run(run_dir)
+    names = run["classes"]
+    classes, files, labels, _ = list_dataset(dataset_dir)
+    idx_of = {f: i for i, f in enumerate(files)}
+    missing = [f for f in run["files"] if f not in idx_of]
+    if missing:
+        raise ValueError(f"{len(missing)} validation files from the run were not found in {dataset_dir}")
+    vidx = np.array([idx_of[f] for f in run["files"]])
+    excluded = set(vidx)
+    test_json = Path(run_dir) / "test_files.json"
+    if test_json.exists():
+        excluded |= {idx_of[f] for f in json.load(open(test_json)) if f in idx_of}
+    tidx = np.array([i for i in range(len(files)) if i not in excluded])
+
+    th = _thumbs(files, size, workers)
+    V, T = th[vidx], th[tidx]
+    Vf = V.reshape(-1, size, size)[:, :, ::-1].reshape(len(V), -1)
+    sim = np.maximum(V @ T.T, Vf @ T.T)
+    best, arg = sim.max(axis=1), sim.argmax(axis=1)
+
+    pred_ok = run["probs"].argmax(axis=1) == run["labels"]
+    rows = []
+    for t in thresholds:
+        has = best >= t
+        row = {"similarity at least": t, "val images with a near copy in training": int(has.sum()),
+               "share of validation": has.mean()}
+        row["accuracy on those"] = pred_ok[has].mean() if has.any() else np.nan
+        row["accuracy on the rest"] = pred_ok[~has].mean() if (~has).any() else np.nan
+        rows.append(row)
+    table = pd.DataFrame(rows).set_index("similarity at least")
+
+    by_class = pd.DataFrame({"class": [names[y] for y in run["labels"]], "best": best})
+    per_class = by_class.groupby("class")["best"].agg(
+        median="median", p90=lambda v: np.quantile(v, 0.9), share_above_098=lambda v: (v >= 0.98).mean())
+
+    # picture: closest pairs, then pairs from the middle of the pack for comparison
+    order = np.argsort(-best)
+    picks = list(order[:n_show]) + list(order[len(order) // 2: len(order) // 2 + n_show])
+    fig, axes = plt.subplots(2, len(picks), figsize=(2.6 * len(picks), 5.8))
+    for col, k in enumerate(picks):
+        for row_i, (path, ttl) in enumerate([(files[vidx[k]], "validation"), (files[tidx[arg[k]]], "training")]):
+            with Image.open(path) as im:
+                axes[row_i, col].imshow(im.convert("L").resize((224, 224)), cmap="gray")
+            axes[row_i, col].axis("off")
+            if row_i == 0:
+                axes[row_i, col].set_title(f"{'closest' if col < n_show else 'typical'}: {best[k]:.3f}\n"
+                                           f"{names[labels[vidx[k]]]}", fontsize=10,
+                                           color=RED if col < n_show else INK)
+            else:
+                axes[row_i, col].set_title(f"nearest {ttl} image\n{names[labels[tidx[arg[k]]]]}", fontsize=9, color=GRAY)
+    fig.suptitle("Validation images and their most similar training image", fontsize=13,
+                 fontweight="bold", color=TEAL)
+    fig.tight_layout(rect=[0, 0, 1, 0.94], h_pad=2.5)
+    out_png = out_png or str(Path(run_dir) / "duplicates.png")
+    fig.savefig(out_png, dpi=120, bbox_inches="tight", facecolor="white")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return table, per_class, out_png
