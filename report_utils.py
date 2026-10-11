@@ -702,3 +702,209 @@ def duplicate_check(dataset_dir, run_dir, size=32, thresholds=(0.99, 0.98, 0.95,
         plt.show()
     plt.close(fig)
     return table, per_class, out_png
+
+
+# ---------------------------------------------------------------------------
+# Lung focus experiment (idea from Bassi and Attux 2022)
+# Three versions of every X ray: full image, lungs only, outside the lungs only.
+# ---------------------------------------------------------------------------
+def _eval_set(run_dir):
+    """The held out test set if the run has one, otherwise the validation set."""
+    d = Path(run_dir)
+    if (d / "test_files.json").exists():
+        with open(d / "test_files.json") as f:
+            files = json.load(f)
+        return files, np.load(d / "test_labels.npy"), np.load(d / "test_probs.npy"), "test"
+    with open(d / "val_files.json") as f:
+        files = json.load(f)
+    return files, np.load(d / "val_labels.npy"), np.load(d / "val_probs.npy"), "validation"
+
+
+def _last_conv_name(model, cfg):
+    layer = LAST_CONV.get(cfg["model"])
+    if layer is None or layer not in [l.name for l in model.layers]:
+        layer = [l.name for l in model.layers if len(l.output.shape) == 4 and "conv" in l.name][-1]
+    return layer
+
+
+def _stem_key(path, root):
+    return os.path.splitext(os.path.relpath(path, root))[0]
+
+
+def variant_summary(run_map, target_class="pneumonia", out_png=None, show=True):
+    """
+    run_map: ordered dict such as {"Full image": run_dir, "Lungs only": run_dir, "Outside the lungs only": run_dir}.
+    Bar chart of accuracy and recall on the held out test set (or validation set), with a 95 percent range
+    worked out from the number of images. The dashed line is what random guessing would score.
+    """
+    rows = []
+    for label, rd in run_map.items():
+        files, y, probs, setname = _eval_set(rd)
+        with open(Path(rd) / "class_labels.json") as f:
+            classes = json.load(f)
+        pred = probs.argmax(axis=1)
+        n = len(y)
+        acc = float((pred == y).mean())
+        t = target_index(classes, target_class)
+        nt = int((y == t).sum())
+        rec = float(((pred == t) & (y == t)).sum() / max(nt, 1))
+        rows.append({"Version": label, "Images": n, "Set": setname, "Accuracy": acc,
+                     "Accuracy range": 1.96 * np.sqrt(acc * (1 - acc) / n),
+                     f"{classes[t].capitalize()} recall": rec,
+                     "Recall range": 1.96 * np.sqrt(rec * (1 - rec) / max(nt, 1))})
+    df = pd.DataFrame(rows).set_index("Version")
+    rec_col = [c for c in df.columns if c.endswith("recall")][0]
+    chance = 1.0 / len(classes)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5))
+    for ax, col, rng_col, title in [(axes[0], "Accuracy", "Accuracy range", "Accuracy (all classes together)"),
+                                    (axes[1], rec_col, "Recall range", f"{classes[t].capitalize()} recall (real cases caught)")]:
+        vals = df[col].values
+        bars = ax.bar(range(len(df)), vals, yerr=df[rng_col].values, capsize=5,
+                      color=[RUN_COLORS[i % len(RUN_COLORS)] for i in range(len(df))], edgecolor="none")
+        for b, v, e in zip(bars, vals, df[rng_col].values):
+            ax.text(b.get_x() + b.get_width() / 2, min(v + e + 0.02, 1.06), f"{v:.0%}", ha="center", fontsize=12,
+                    fontweight="bold")
+        ax.set_xticks(range(len(df)))
+        ax.set_xticklabels([textwrap.fill(i, 14) for i in df.index], fontsize=11)
+        ax.set_ylim(0, 1.15)
+        ax.set_title(title, fontsize=13, fontweight="bold", color=TEAL, loc="left")
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    axes[0].axhline(chance, color=RED, ls="--", lw=1.3)
+    axes[0].text(-0.45, chance + 0.015, "random guessing", color=RED, fontsize=10, ha="left")
+    fig.suptitle(f"Same classifier, three versions of every X ray ({df['Set'].iloc[0]} images, black lines show a "
+                 f"95 percent range)", fontsize=13.5, fontweight="bold", color=INK, y=1.0)
+    fig.tight_layout()
+    out_png = out_png or "lung_focus_summary.png"
+    fig.savefig(out_png, dpi=130, bbox_inches="tight", facecolor="white")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return df
+
+
+def gradcam_variants(run_map, per_class=1, seed=0, out_png=None, show=True):
+    """
+    Same X rays through every version. First column is the original image, then one Grad CAM picture per version
+    (each model sees its own version of the image). The first entry of run_map must be the full image run.
+    """
+    from tensorflow.keras.models import load_model
+
+    names = list(run_map)
+    runs = {k: load_run(v) for k, v in run_map.items()}
+    sets = {k: _eval_set(v) for k, v in run_map.items()}
+    ref = names[0]
+    ref_root = runs[ref]["config"]["dataset"]
+    lookup = {}
+    for k in names:
+        root = runs[k]["config"]["dataset"]
+        lookup[k] = {_stem_key(f, root): f for f in sets[k][0]}
+    ref_files, ref_y = sets[ref][0], sets[ref][1]
+    keys = [_stem_key(f, ref_root) for f in ref_files]
+    for k in names[1:]:
+        missing = [x for x in keys if x not in lookup[k]]
+        if missing:
+            raise ValueError(f"Run '{k}' does not use the same images as '{ref}' (for example {missing[0]}).")
+    classes = runs[ref]["classes"]
+    rng = np.random.RandomState(seed)
+    chosen = []
+    for c in range(len(classes)):
+        idx = np.where(ref_y == c)[0]
+        chosen += [int(i) for i in rng.choice(idx, min(per_class, len(idx)), replace=False)]
+
+    cols = 1 + len(names)
+    fig, axes = plt.subplots(len(chosen), cols, figsize=(3.0 * cols, 3.05 * len(chosen) + 0.8))
+    axes = np.atleast_2d(axes)
+    for a in axes.ravel():
+        a.axis("off")
+    for j, k in enumerate(["Original X ray"] + names):
+        axes[0, j].set_title(k, fontsize=12.5, fontweight="bold", color=INK, pad=10)
+    for r, i in enumerate(chosen):
+        raw0 = _load_rgb(ref_files[i])
+        axes[r, 0].imshow(raw0.astype("uint8"))
+        axes[r, 0].text(-0.04, 0.5, f"Real: {classes[ref_y[i]]}", transform=axes[r, 0].transAxes, rotation=90,
+                        va="center", ha="right", fontsize=12, fontweight="bold", color=TEAL)
+    for j, k in enumerate(names, start=1):
+        cfg = runs[k]["config"]
+        model = load_model(Path(run_map[k]) / "best_model.h5", compile=False)
+        layer = _last_conv_name(model, cfg)
+        pre = get_preprocess(cfg["model"], cfg.get("preprocess", "rescale"), cfg.get("clahe", False))
+        for r, i in enumerate(chosen):
+            raw = _load_rgb(lookup[k][keys[i]])
+            x = pre(raw)[None, ...]
+            probs = model.predict(x, verbose=0)[0]
+            p = int(probs.argmax())
+            cam = cv2.resize(_gradcam(model, x, layer, p), IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+            heat = cv2.cvtColor(cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+            axes[r, j].imshow((0.55 * raw + 0.45 * heat).astype("uint8"))
+            ok = p == int(ref_y[i])
+            axes[r, j].set_title(f"Said: {classes[p]} ({probs[p]:.0%})", fontsize=11, color=GREEN if ok else RED)
+        del model
+    fig.suptitle("Where each version of the model looked (red means more attention)", fontsize=15,
+                 fontweight="bold", color=TEAL, y=1.0)
+    fig.tight_layout()
+    out_png = out_png or "lung_focus_gradcam.png"
+    fig.savefig(out_png, dpi=130, bbox_inches="tight", facecolor="white")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_png
+
+
+def gradcam_lung_share(run_dir, masks_npz, per_class=100, seed=0, out_png=None, show=True):
+    """
+    For a model trained on the full image: how much of its Grad CAM attention lands inside the lung mask,
+    compared with how much of the picture the lungs fill. A ratio near 1 means the model pays no special
+    attention to the lungs. Above 1 means it favors the lungs. Below 1 means it favors the outside.
+    Note that the outside area includes the heart, which can matter medically, and that Grad CAM is coarse.
+    """
+    from tensorflow.keras.models import load_model
+
+    run = load_run(run_dir)
+    cfg, classes = run["config"], run["classes"]
+    files, y, probs, setname = _eval_set(run_dir)
+    z = np.load(masks_npz)
+    index = {r: i for i, r in enumerate(z["rel"])}
+    masks = z["mask"]
+    model = load_model(Path(run_dir) / "best_model.h5", compile=False)
+    layer = _last_conv_name(model, cfg)
+    pre = get_preprocess(cfg["model"], cfg.get("preprocess", "rescale"), cfg.get("clahe", False))
+    rng = np.random.RandomState(seed)
+    rows = []
+    for c, name in enumerate(classes):
+        idx = np.where(y == c)[0]
+        idx = rng.choice(idx, min(per_class, len(idx)), replace=False)
+        inside, area = [], []
+        for i in idx:
+            rel = os.path.relpath(files[i], cfg["dataset"])
+            lung = masks[index[rel]] > 127
+            x = pre(_load_rgb(files[i]))[None, ...]
+            cam = cv2.resize(_gradcam(model, x, layer, int(probs[i].argmax())), IMG_SIZE, interpolation=cv2.INTER_LINEAR)
+            inside.append(float((cam * lung).sum() / (cam.sum() + 1e-8)))
+            area.append(float(lung.mean()))
+        rows.append({"Class": name, "Images": len(idx), "Lungs fill": np.mean(area),
+                     "Attention inside lungs": np.mean(inside), "Ratio": np.mean(inside) / np.mean(area)})
+    df = pd.DataFrame(rows).set_index("Class")
+
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    xs = np.arange(len(df))
+    b1 = ax.bar(xs - 0.2, df["Lungs fill"], 0.4, color=GRAY, label="Share of the picture the lungs fill")
+    b2 = ax.bar(xs + 0.2, df["Attention inside lungs"], 0.4, color=TEAL, label="Share of model attention inside the lungs")
+    for b in list(b1) + list(b2):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.01, f"{b.get_height():.0%}", ha="center", fontsize=11)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([c.capitalize() for c in df.index], fontsize=12)
+    ax.set_ylim(0, 1.0)
+    ax.legend(frameon=False, fontsize=10, loc="upper left")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.set_title(f"Does the full image model look at the lungs? ({setname} images)", fontsize=13, fontweight="bold",
+                 color=TEAL, loc="left")
+    fig.tight_layout()
+    out_png = out_png or str(Path(run_dir) / "lung_share.png")
+    fig.savefig(out_png, dpi=130, bbox_inches="tight", facecolor="white")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return df
