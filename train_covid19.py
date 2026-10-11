@@ -66,6 +66,12 @@ def get_data(dataset_dir, cache_file):
     print(f"[INFO] found {len(files)} images in {len(classes)} classes: {classes}")
     if skipped:
         print(f"[INFO] files skipped because they are not a supported image type: {dict(skipped)}")
+    extra = report_utils.duplicate_name_count(files, labels)
+    if extra > 0.02 * len(files):
+        raise SystemExit(f"STOP: {extra} of {len(files)} files have the same name as another file in the same class. "
+                         "The dataset folder probably holds a copied folder, for example all/covid/covid. "
+                         "Training on it would put the same images in both the training and validation sets. "
+                         "Run the dataset check cell in the notebook, then start again.")
     fingerprint = report_utils.file_fingerprint(files)
 
     X = None
@@ -300,6 +306,8 @@ if __name__ == '__main__':
                     help="rescale divides pixels by 255, imagenet uses each model's own original scaling")
     ap.add_argument("--clahe", action="store_true", help="boost image contrast before training")
     ap.add_argument("--weights", default="imagenet", help="imagenet, or none for a quick code test")
+    ap.add_argument("--max_per_class", type=int, default=0,
+                    help="use only the first N images of each class (0 means all). For quick tests of the whole pipeline")
     args = ap.parse_args()
 
     if args.init_from and len(args.models) != 1:
@@ -316,6 +324,11 @@ if __name__ == '__main__':
     elif args.cache_file.lower() == "none":
         args.cache_file = None
     data = get_data(args.dataset, args.cache_file)
+    if args.max_per_class:
+        classes_, files_, labels_, X_ = data
+        keep = np.concatenate([np.where(labels_ == c)[0][:args.max_per_class] for c in range(len(classes_))])
+        data = (classes_, [files_[i] for i in keep], labels_[keep], X_[keep])
+        print(f"[INFO] quick test: using only the first {args.max_per_class} images of each class ({len(keep)} images)")
 
     results = []
     for name in args.models:
