@@ -2,30 +2,6 @@
 lung_focus.py
 Adds the idea from Bassi and Attux (2022), "Covid 19 detection using chest X rays: is lung segmentation
 important for generalization?", Research on Biomedical Engineering 38(4), 1121 to 1139.
-
-It uses the lung finding network that the paper authors published (GPL 3.0 licence, so we download it at run
-time and never copy it into our own repository):
-    https://github.com/PedroRASB/COVID-19-detection-with-lung-segmentation
-
-For every X ray in the dataset it makes two new copies:
-    lung     the image multiplied by the lung probability, so everything outside the lungs fades to black
-    outside  the image multiplied by one minus the lung probability, so only the area outside the lungs stays
-The file names and class folders stay the same, so train_covid19.py can train on each copy with no changes
-and every run uses exactly the same train, validation and test images.
-
-USAGE
-    python lung_focus.py --dataset /content/covid_pneumonia_dataset_wrapped/all --outdir /content/lung_data
-Quick test on a few images:
-    python lung_focus.py --dataset DATASET --outdir /content/lung_test --limit 20
-
-OUTPUT
-    OUTDIR/lung/all/<class>/<file>.png
-    OUTDIR/outside/all/<class>/<file>.png
-    OUTDIR/masks.npz                 the lung probability of every image, as 0 to 255
-    OUTDIR/lung_focus_preview.png    one example per class, ready for a slide
-    OUTDIR/lung_focus_more.png       more examples
-    OUTDIR/lung_focus_quality.png    mask size per class and the most unusual masks
-    OUTDIR/lung_focus_stats.json     the numbers behind the quality figure
 """
 import argparse
 import hashlib
@@ -297,6 +273,10 @@ def main():
     classes, files, labels, skipped = ru.list_dataset(args.dataset)
     if skipped:
         print(f"[INFO] files skipped because they are not a supported image type: {dict(skipped)}")
+    extra = ru.duplicate_name_count(files, labels)
+    if extra > 0.02 * len(files):
+        raise SystemExit(f"STOP: {extra} of {len(files)} files have the same name as another file in the same class. "
+                         "The dataset folder probably holds a copied folder. Run the dataset check cell first.")
     keep = np.arange(len(files))
     if args.limit:
         keep = np.concatenate([np.where(labels == c)[0][:args.limit] for c in range(len(classes))])
@@ -314,7 +294,11 @@ def main():
     seg = load_segmenter(args.model_dir or os.path.join(args.outdir, "paper_model"), device)
     t0 = time.time()
     masks = lung_probability(seg, X, device, args.batch)
-    print(f"[INFO] lung finding took {(time.time() - t0) / 60:.1f} minutes")
+    took = time.time() - t0
+    print(f"[INFO] lung finding took {took / 60:.1f} minutes")
+    if args.limit:
+        print(f"[INFO] rough guess for the whole dataset (6939 images): about {took / len(X) * 6939 / 60:.0f} minutes. "
+              "The first batches include start up time, so the real run is usually a bit faster.")
     del seg
     if device == "cuda":
         torch.cuda.empty_cache()
