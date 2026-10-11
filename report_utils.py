@@ -541,7 +541,7 @@ def clahe_preview(dataset_dir, n_per_class=2, seed=0, out_png=None, show=True):
 # ---------------------------------------------------------------------------
 # Dataset listing and image loading (shared by training and the checks below)
 # ---------------------------------------------------------------------------
-IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".ppm", ".tif", ".tiff")
+IMG_EXT = (".png", ".jpg", ".jpeg", ".jfif", ".bmp", ".ppm", ".tif", ".tiff")
 
 
 def list_dataset(dataset_dir):
@@ -562,6 +562,42 @@ def list_dataset(dataset_dir):
                 else:
                     skipped[(c, os.path.splitext(fn)[1].lower() or "(no extension)")] += 1
     return classes, files, np.array(labels, dtype=int), skipped
+
+
+def duplicate_name_count(files, labels):
+    """How many extra copies exist: file names that appear more than once inside the same class folder tree."""
+    counts = Counter((int(l), os.path.basename(f)) for f, l in zip(files, labels))
+    return int(sum(v - 1 for v in counts.values() if v > 1))
+
+
+def remove_nested_copies(dataset_dir, apply=True):
+    """
+    Fixes the case where a class folder contains a second copy of itself (for example all/covid/covid).
+    A folder inside a class folder is removed only if every file in it also exists directly in the class folder,
+    so nothing unique is ever deleted. With apply=False it only reports what it would remove.
+    """
+    import shutil
+
+    removed, kept = [], []
+    for c in sorted(d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))):
+        top = os.path.join(dataset_dir, c)
+        loose = {fn for fn in os.listdir(top) if os.path.isfile(os.path.join(top, fn))}
+        for sub in sorted(d for d in os.listdir(top) if os.path.isdir(os.path.join(top, d))):
+            sub_path = os.path.join(top, sub)
+            names = [fn for _, _, fns in os.walk(sub_path) for fn in fns]
+            if names and all(n in loose for n in names):
+                removed.append((sub_path, len(names)))
+                if apply:
+                    shutil.rmtree(sub_path)
+            else:
+                kept.append((sub_path, len(names)))
+    for path, n in removed:
+        print(("Removed" if apply else "Would remove") + f" the copied folder {path} ({n} files)")
+    for path, n in kept:
+        print(f"Left alone {path} ({n} files), it holds files that are not in the class folder itself")
+    if not removed and not kept:
+        print("No copied folders found.")
+    return removed, kept
 
 
 def load_image_array(files, size=224, workers=4):
@@ -874,6 +910,9 @@ def gradcam_lung_share(run_dir, masks_npz, per_class=100, seed=0, out_png=None, 
     rows = []
     for c, name in enumerate(classes):
         idx = np.where(y == c)[0]
+        idx = np.array([i for i in idx if os.path.relpath(files[i], cfg["dataset"]) in index], dtype=int)
+        if len(idx) == 0:
+            continue
         idx = rng.choice(idx, min(per_class, len(idx)), replace=False)
         inside, area = [], []
         for i in idx:
@@ -885,6 +924,8 @@ def gradcam_lung_share(run_dir, masks_npz, per_class=100, seed=0, out_png=None, 
             area.append(float(lung.mean()))
         rows.append({"Class": name, "Images": len(idx), "Lungs fill": np.mean(area),
                      "Attention inside lungs": np.mean(inside), "Ratio": np.mean(inside) / np.mean(area)})
+    if not rows:
+        raise ValueError("None of the evaluation images have a lung mask. The masks were made for a different set of images.")
     df = pd.DataFrame(rows).set_index("Class")
 
     fig, ax = plt.subplots(figsize=(8, 4.6))
