@@ -657,6 +657,44 @@ def source_check(run_dir, workers=4):
     return table, pd.DataFrame(sizes).set_index("class"), df
 
 
+def split_check(dataset_dir, run_dir, workers=8):
+    """
+    Compares the three groups of images (training, validation, test) class by class. The filename split cuts each
+    class by position in the sorted file names, so if file names follow the image source, the groups can look
+    different. The table shows the file names at the edges of each group and the usual image size in it.
+    Reads only the image headers, so it is fast.
+    """
+    run = load_run(run_dir)
+    classes, files, labels, _ = list_dataset(dataset_dir)
+    d = Path(run_dir)
+    val = {os.path.abspath(f) for f in run["files"]}
+    test = ({os.path.abspath(f) for f in json.load(open(d / "test_files.json"))}
+            if (d / "test_files.json").exists() else set())
+    files = [os.path.abspath(f) for f in files]
+
+    def size_of(path):
+        with Image.open(path) as im:
+            return im.size
+
+    with ThreadPoolExecutor(workers) as ex:
+        sizes = list(ex.map(size_of, files))
+    rows = []
+    for ci, c in enumerate(classes):
+        for name, keep in [("training", lambda f: f not in val and f not in test),
+                           ("validation", lambda f: f in val), ("test", lambda f: f in test)]:
+            idx = [i for i in range(len(files)) if labels[i] == ci and keep(files[i])]
+            if not idx:
+                continue
+            tags = Counter(f"{sizes[i][0]}x{sizes[i][1]}" for i in idx)
+            top, n_top = tags.most_common(1)[0]
+            names = [os.path.basename(files[i]) for i in idx]
+            rows.append({"class": c, "group": name, "images": len(idx), "first file": names[0], "last file": names[-1],
+                         "median width": int(np.median([sizes[i][0] for i in idx])),
+                         "median height": int(np.median([sizes[i][1] for i in idx])),
+                         "most common size": top, "share with it": n_top / len(idx)})
+    return pd.DataFrame(rows).set_index(["class", "group"])
+
+
 # ---------------------------------------------------------------------------
 # Check 2: are near copies of training images sitting in the validation set?
 # ---------------------------------------------------------------------------
@@ -744,10 +782,10 @@ def duplicate_check(dataset_dir, run_dir, size=32, thresholds=(0.99, 0.98, 0.95,
 # Lung focus experiment (idea from Bassi and Attux 2022)
 # Three versions of every X ray: full image, lungs only, outside the lungs only.
 # ---------------------------------------------------------------------------
-def _eval_set(run_dir):
-    """The held out test set if the run has one, otherwise the validation set."""
+def _eval_set(run_dir, which=None):
+    """The held out test set if the run has one, otherwise the validation set. which="validation" forces validation."""
     d = Path(run_dir)
-    if (d / "test_files.json").exists():
+    if which != "validation" and (d / "test_files.json").exists():
         with open(d / "test_files.json") as f:
             files = json.load(f)
         return files, np.load(d / "test_labels.npy"), np.load(d / "test_probs.npy"), "test"
@@ -764,10 +802,14 @@ def _last_conv_name(model, cfg):
 
 
 def _stem_key(path, root):
-    return os.path.splitext(os.path.relpath(path, root))[0]
+    """Folder plus file name with every image extension removed, so photo.jpg, photo.png and photo.jpg.png match."""
+    rel = os.path.relpath(path, root)
+    while os.path.splitext(rel)[1].lower() in IMG_EXT:
+        rel = os.path.splitext(rel)[0]
+    return rel
 
 
-def variant_summary(run_map, target_class="pneumonia", out_png=None, show=True):
+def variant_summary(run_map, target_class="pneumonia", out_png=None, show=True, which=None):
     """
     run_map: ordered dict such as {"Full image": run_dir, "Lungs only": run_dir, "Outside the lungs only": run_dir}.
     Bar chart of accuracy and recall on the held out test set (or validation set), with a 95 percent range
@@ -775,7 +817,7 @@ def variant_summary(run_map, target_class="pneumonia", out_png=None, show=True):
     """
     rows = []
     for label, rd in run_map.items():
-        files, y, probs, setname = _eval_set(rd)
+        files, y, probs, setname = _eval_set(rd, which)
         with open(Path(rd) / "class_labels.json") as f:
             classes = json.load(f)
         pred = probs.argmax(axis=1)
@@ -832,16 +874,20 @@ def gradcam_variants(run_map, per_class=1, seed=0, out_png=None, show=True):
     sets = {k: _eval_set(v) for k, v in run_map.items()}
     ref = names[0]
     ref_root = runs[ref]["config"]["dataset"]
-    lookup = {}
-    for k in names:
-        root = runs[k]["config"]["dataset"]
-        lookup[k] = {_stem_key(f, root): f for f in sets[k][0]}
     ref_files, ref_y = sets[ref][0], sets[ref][1]
     keys = [_stem_key(f, ref_root) for f in ref_files]
+    # The versions list their images in the same order, so the i th evaluation image of one run is the i th of the
+    # others. Two files with the same name but different extensions made the new names longer, so we match by
+    # position and then confirm the names agree once the extensions are removed.
     for k in names[1:]:
-        missing = [x for x in keys if x not in lookup[k]]
-        if missing:
-            raise ValueError(f"Run '{k}' does not use the same images as '{ref}' (for example {missing[0]}).")
+        other_files = sets[k][0]
+        other_root = runs[k]["config"]["dataset"]
+        if len(other_files) != len(ref_files) or not np.array_equal(sets[k][1], ref_y):
+            raise ValueError(f"Run '{k}' does not use the same images as '{ref}' (different count or labels).")
+        bad = [a for a, f in zip(keys, other_files) if a != _stem_key(f, other_root)]
+        if bad:
+            raise ValueError(f"Run '{k}' does not use the same images as '{ref}' (for example {bad[0]}).")
+    lookup = {k: sets[k][0] for k in names}
     classes = runs[ref]["classes"]
     rng = np.random.RandomState(seed)
     chosen = []
@@ -867,7 +913,7 @@ def gradcam_variants(run_map, per_class=1, seed=0, out_png=None, show=True):
         layer = _last_conv_name(model, cfg)
         pre = get_preprocess(cfg["model"], cfg.get("preprocess", "rescale"), cfg.get("clahe", False))
         for r, i in enumerate(chosen):
-            raw = _load_rgb(lookup[k][keys[i]])
+            raw = _load_rgb(lookup[k][i])
             x = pre(raw)[None, ...]
             probs = model.predict(x, verbose=0)[0]
             p = int(probs.argmax())
